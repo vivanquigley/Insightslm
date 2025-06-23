@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
@@ -31,11 +30,19 @@ serve(async (req) => {
     if (!webServiceUrl || !authHeader) {
       console.error('Missing environment variables:', {
         hasUrl: !!webServiceUrl,
-        hasAuth: !!authHeader
+        hasAuth: !!authHeader,
+        urlValue: webServiceUrl ? 'SET' : 'NOT_SET',
+        authValue: authHeader ? 'SET' : 'NOT_SET'
       })
       
       return new Response(
-        JSON.stringify({ error: 'Web service configuration missing' }),
+        JSON.stringify({ 
+          error: 'Web service configuration missing',
+          details: {
+            hasUrl: !!webServiceUrl,
+            hasAuth: !!authHeader
+          }
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -52,7 +59,7 @@ serve(async (req) => {
       .update({ generation_status: 'generating' })
       .eq('id', notebookId)
 
-    console.log('Calling external web service...')
+    console.log('Calling external web service at:', webServiceUrl)
 
     // Prepare payload based on source type
     let payload: any = {
@@ -64,33 +71,62 @@ serve(async (req) => {
       payload.filePath = filePath;
     } else {
       // For text sources, we need to get the content from the database
-      const { data: source } = await supabaseClient
+      const { data: source, error: sourceError } = await supabaseClient
         .from('sources')
         .select('content')
         .eq('notebook_id', notebookId)
         .single();
       
+      if (sourceError) {
+        console.error('Error fetching source content:', sourceError);
+        await supabaseClient
+          .from('notebooks')
+          .update({ generation_status: 'failed' })
+          .eq('id', notebookId)
+        
+        return new Response(
+          JSON.stringify({ error: 'Failed to fetch source content', details: sourceError }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+      
       if (source?.content) {
         payload.content = source.content.substring(0, 5000); // Limit content size
+      } else {
+        console.error('No content found for text source');
+        await supabaseClient
+          .from('notebooks')
+          .update({ generation_status: 'failed' })
+          .eq('id', notebookId)
+        
+        return new Response(
+          JSON.stringify({ error: 'No content found for text source' }),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
       }
     }
 
-    console.log('Sending payload to web service:', payload);
+    console.log('Sending payload to web service:', JSON.stringify(payload, null, 2));
 
-    // Call external web service
-    const response = await fetch(webServiceUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': authHeader,
-      },
-      body: JSON.stringify(payload)
-    })
-
-    if (!response.ok) {
-      console.error('Web service error:', response.status, response.statusText)
-      const errorText = await response.text();
-      console.error('Error response:', errorText);
+    // Call external web service with timeout and better error handling
+    let response;
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      response = await fetch(webServiceUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': authHeader,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+    } catch (fetchError) {
+      console.error('Fetch error:', fetchError);
       
       // Update status to failed
       await supabaseClient
@@ -99,13 +135,73 @@ serve(async (req) => {
         .eq('id', notebookId)
 
       return new Response(
-        JSON.stringify({ error: 'Failed to generate content from web service' }),
+        JSON.stringify({ 
+          error: 'Failed to connect to web service',
+          details: {
+            message: fetchError.message,
+            name: fetchError.name,
+            url: webServiceUrl
+          }
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    const generatedData = await response.json()
-    console.log('Generated data:', generatedData)
+    console.log('Web service response status:', response.status);
+    console.log('Web service response headers:', Object.fromEntries(response.headers.entries()));
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Web service error details:', {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: errorText,
+        url: webServiceUrl
+      });
+      
+      // Update status to failed
+      await supabaseClient
+        .from('notebooks')
+        .update({ generation_status: 'failed' })
+        .eq('id', notebookId)
+
+      return new Response(
+        JSON.stringify({ 
+          error: 'Web service returned error',
+          details: {
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url: webServiceUrl
+          }
+        }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    let generatedData;
+    try {
+      const responseText = await response.text();
+      console.log('Raw web service response:', responseText);
+      generatedData = JSON.parse(responseText);
+      console.log('Parsed generated data:', JSON.stringify(generatedData, null, 2));
+    } catch (parseError) {
+      console.error('Failed to parse web service response:', parseError);
+      
+      await supabaseClient
+        .from('notebooks')
+        .update({ generation_status: 'failed' })
+        .eq('id', notebookId)
+
+      return new Response(
+        JSON.stringify({ 
+          error: 'Invalid JSON response from web service',
+          details: parseError.message
+        }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
 
     // Parse the response format: object with output property
     let title, description, notebookIcon, backgroundColor, exampleQuestions;
@@ -118,7 +214,11 @@ serve(async (req) => {
       backgroundColor = output.background_color;
       exampleQuestions = output.example_questions || [];
     } else {
-      console.error('Unexpected response format:', generatedData)
+      console.error('Unexpected response format:', {
+        hasOutput: !!generatedData?.output,
+        keys: generatedData ? Object.keys(generatedData) : 'null',
+        fullResponse: generatedData
+      });
       
       await supabaseClient
         .from('notebooks')
@@ -126,13 +226,23 @@ serve(async (req) => {
         .eq('id', notebookId)
 
       return new Response(
-        JSON.stringify({ error: 'Invalid response format from web service' }),
+        JSON.stringify({ 
+          error: 'Invalid response format from web service',
+          details: {
+            expected: 'object with output property',
+            received: generatedData ? Object.keys(generatedData) : 'null',
+            fullResponse: generatedData
+          }
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
     if (!title) {
-      console.error('No title returned from web service')
+      console.error('No title returned from web service:', {
+        output: generatedData?.output,
+        titleValue: title
+      });
       
       await supabaseClient
         .from('notebooks')
@@ -140,7 +250,13 @@ serve(async (req) => {
         .eq('id', notebookId)
 
       return new Response(
-        JSON.stringify({ error: 'No title in response from web service' }),
+        JSON.stringify({ 
+          error: 'No title in response from web service',
+          details: {
+            output: generatedData?.output,
+            titleValue: title
+          }
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
@@ -152,7 +268,7 @@ serve(async (req) => {
         title: title,
         description: description || null,
         icon: notebookIcon || '📝',
-        color: backgroundColor || 'bg-gray-100',
+        color: backgroundColor || 'gray',
         example_questions: exampleQuestions || [],
         generation_status: 'completed'
       })
@@ -161,12 +277,21 @@ serve(async (req) => {
     if (notebookError) {
       console.error('Notebook update error:', notebookError)
       return new Response(
-        JSON.stringify({ error: 'Failed to update notebook' }),
+        JSON.stringify({ 
+          error: 'Failed to update notebook',
+          details: notebookError
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    console.log('Successfully updated notebook with example questions:', exampleQuestions)
+    console.log('Successfully updated notebook with:', {
+      title,
+      description,
+      icon: notebookIcon,
+      color: backgroundColor,
+      exampleQuestions
+    });
 
     return new Response(
       JSON.stringify({ 
@@ -184,7 +309,14 @@ serve(async (req) => {
   } catch (error) {
     console.error('Edge function error:', error)
     return new Response(
-      JSON.stringify({ error: 'Internal server error' }),
+      JSON.stringify({ 
+        error: 'Internal server error',
+        details: {
+          message: error.message,
+          name: error.name,
+          stack: error.stack
+        }
+      }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
   }
